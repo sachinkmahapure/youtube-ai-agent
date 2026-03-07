@@ -1,0 +1,13 @@
+[project]
+name = "youtube-ai-agent"
+version = "1.0.0"
+description = "Automated AI pipeline to create and upload 30-day YouTube video series"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["youtube_ai_agent*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
