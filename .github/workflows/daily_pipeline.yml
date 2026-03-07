@@ -1,0 +1,95 @@
+name: Daily YouTube Pipeline
+
+on:
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: "Content topic"
+        required: true
+        default: "Personal Finance for Beginners"
+      format:
+        description: "Video format"
+        required: true
+        default: "short"
+        type: choice
+        options: [short, long, both]
+      days:
+        description: "Number of days to produce"
+        required: true
+        default: "1"
+
+env:
+  GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+  TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+  PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+  TOPIC: ${{ github.event.inputs.topic || 'Personal Finance for Beginners' }}
+  FORMAT: ${{ github.event.inputs.format || 'short' }}
+  DAYS: ${{ github.event.inputs.days || '1' }}
+
+jobs:
+  produce-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y ffmpeg
+
+      - name: Create virtual environment and install dependencies
+        run: |
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install torch==2.1.2 torchvision torchaudio \
+              --index-url https://download.pytorch.org/whl/cpu
+          uv pip install "faster-whisper>=1.0.0,<2.0.0"
+          uv pip install -r requirements.txt
+          uv pip install -e .
+
+      - name: Restore pipeline state cache
+        uses: actions/cache@v4
+        with:
+          path: output/
+          key: pipeline-${{ env.TOPIC }}-${{ github.run_number }}
+          restore-keys: pipeline-${{ env.TOPIC }}-
+
+      - name: Write YouTube credentials from secrets
+        run: |
+          mkdir -p config
+          echo '${{ secrets.YOUTUBE_CLIENT_SECRETS }}' > config/client_secrets.json
+          echo '${{ secrets.YOUTUBE_CREDENTIALS }}'    > config/youtube_credentials.json
+
+      - name: Run pipeline
+        run: |
+          source .venv/bin/activate
+          python main.py run \
+            --topic "${{ env.TOPIC }}" \
+            --format "${{ env.FORMAT }}" \
+            --days "${{ env.DAYS }}"
+
+      - name: Upload rendered videos as artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: videos-run-${{ github.run_number }}
+          path: output/videos/
+          retention-days: 7
+
+      - name: Save pipeline state
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: output/
+          key: pipeline-${{ env.TOPIC }}-${{ github.run_number }}

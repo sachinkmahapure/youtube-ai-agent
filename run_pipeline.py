@@ -61,6 +61,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+import logging
+
 import requests
 from dotenv import load_dotenv
 from rich.console import Console
@@ -88,15 +90,50 @@ jobs_table  = db.table("jobs")
 plans_table = db.table("plans")
 
 
+# ── Logger ────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
+)
+log = logging.getLogger("pipeline")
+
+def log_groq_request(label: str, prompt: str):
+    log.debug("=" * 70)
+    log.debug(f"GROQ REQUEST  [{label}]")
+    log.debug("=" * 70)
+    log.debug(prompt)
+
+def log_groq_response(label: str, raw: str):
+    log.debug("-" * 70)
+    log.debug(f"GROQ RESPONSE [{label}]")
+    log.debug("-" * 70)
+    log.debug(raw)
+    log.debug("")
+
+def log_error(label: str, error: Exception, extra: str = ""):
+    log.error("=" * 70)
+    log.error(f"ERROR [{label}]: {error}")
+    if extra:
+        log.error(extra)
+    log.error("=" * 70)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # GROQ LLM
 # ══════════════════════════════════════════════════════════════════════════════
 
-def call_groq(prompt: str, max_tokens: int = 4096) -> str:
-    """Call Groq API directly via requests — no SDK needed."""
+def call_groq(prompt: str, max_tokens: int = 4096, label: str = "groq") -> str:
+    """Call Groq API directly via requests — logs every request and response."""
     if not GROQ_API_KEY:
         console.print("[red]ERROR: GROQ_API_KEY not set in .env[/red]")
         sys.exit(1)
+
+    log_groq_request(label, prompt)
 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
@@ -114,8 +151,11 @@ def call_groq(prompt: str, max_tokens: int = 4096) -> str:
         try:
             r = requests.post(url, headers=headers, json=body, timeout=60)
             r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
+            content = r.json()["choices"][0]["message"]["content"]
+            log_groq_response(label, content)
+            return content
         except requests.HTTPError as e:
+            log_error(label, e, f"HTTP {r.status_code} — body: {r.text[:500]}")
             if r.status_code == 429:
                 wait = 10 * (attempt + 1)
                 console.print(f"[yellow]Rate limited — waiting {wait}s...[/yellow]")
@@ -123,32 +163,53 @@ def call_groq(prompt: str, max_tokens: int = 4096) -> str:
             else:
                 raise
         except Exception as e:
+            log_error(label, e, f"Attempt {attempt + 1}/3")
             if attempt == 2:
                 raise
             time.sleep(5)
     return ""
 
 
-def parse_json(text: str):
-    """Robustly extract JSON from LLM output."""
+def parse_json(text: str, expect: str = "dict"):
+    """
+    Robustly extract JSON from LLM output.
+    expect = 'dict' | 'list'
+    Also handles the common case where the LLM wraps a single object in [].
+    """
     text = text.strip()
     # Strip markdown fences
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\s*```\s*$", "", text, flags=re.MULTILINE)
     text = text.strip()
-    # Find JSON boundaries
-    for start, end in [("[", "]"), ("{", "}")]:
+
+    # Try direct parse first
+    try:
+        parsed = json.loads(text)
+        # If we expected a dict but got a 1-item list containing a dict, unwrap it
+        if expect == "dict" and isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
+            log.debug("parse_json: unwrapped single-item list → dict")
+            return parsed[0]
+        return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Try extracting by bracket boundaries — dict first, then list
+    order = [("{", "}"), ("[", "]")] if expect == "dict" else [("[", "]"), ("{", "}")]
+    for start, end in order:
         s = text.find(start)
         e = text.rfind(end) + 1
         if s >= 0 and e > s:
             try:
-                return json.loads(text[s:e])
+                parsed = json.loads(text[s:e])
+                if expect == "dict" and isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
+                    log.debug("parse_json: unwrapped single-item list → dict (bracket extract)")
+                    return parsed[0]
+                return parsed
             except json.JSONDecodeError:
                 pass
-    try:
-        return json.loads(text)
-    except Exception:
-        return None
+
+    log.warning(f"parse_json: could not parse JSON. First 300 chars: {text[:300]}")
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -185,8 +246,8 @@ Rules:
 
 Return raw JSON only. No markdown, no explanation.
 """
-    raw = call_groq(prompt, max_tokens=6000)
-    plan = parse_json(raw)
+    raw = call_groq(prompt, max_tokens=6000, label="plan")
+    plan = parse_json(raw, expect="list")
 
     if not isinstance(plan, list) or len(plan) == 0:
         console.print("[red]Failed to parse content plan. Raw output:[/red]")
@@ -268,11 +329,12 @@ Return ONLY valid JSON:
 """
 
     console.print(f"  [cyan]Writing {fmt} script for Day {day}...[/cyan]")
-    raw    = call_groq(prompt)
-    result = parse_json(raw)
+    raw    = call_groq(prompt, label=f"script_day{day}_{fmt}")
+    result = parse_json(raw, expect="dict")
 
-    if not result:
-        console.print(f"[yellow]  Script parse failed, using raw text[/yellow]")
+    if not isinstance(result, dict):
+        log.warning(f"write_script day {day} {fmt}: parse returned {type(result).__name__}, falling back to raw text")
+        console.print(f"[yellow]  Script parse returned unexpected type ({type(result).__name__}), using raw text[/yellow]")
         result = {"full_script": raw, "hook": hook, "word_count": len(raw.split()),
                   "estimated_duration_seconds": 58 if fmt == "short" else 480,
                   "scene_breaks": [], "search_queries_for_visuals": [title, angle]}
@@ -509,8 +571,8 @@ Return ONLY valid JSON:
   "thumbnail_prompt": "one sentence visual description for thumbnail"
 }}
 """
-    raw    = call_groq(prompt)
-    result = parse_json(raw)
+    raw    = call_groq(prompt, label=f"metadata_day{day}_{fmt}")
+    result = parse_json(raw, expect="dict")
     if not isinstance(result, dict):
         result = {"title": title, "description": topic, "tags": [topic], "category_id": "27"}
     return result
@@ -528,7 +590,12 @@ def run(topic: str, fmt: str, days: int, start_day: int, no_assembly: bool):
     console.print(f"  Format   : {fmt}")
     console.print(f"  Days     : {start_day} → {start_day + days - 1}")
     console.print(f"  Assembly : {'Off (scripts + metadata only)' if no_assembly else 'On'}")
+    console.print(f"  Log file : [dim]{LOG_FILE.resolve()}[/dim]")
     console.print()
+
+    log.info("=" * 70)
+    log.info(f"PIPELINE START  topic={topic!r}  format={fmt}  days={days}  start_day={start_day}  no_assembly={no_assembly}")
+    log.info("=" * 70)
 
     # Validate keys
     if not GROQ_API_KEY:
@@ -549,11 +616,13 @@ def run(topic: str, fmt: str, days: int, start_day: int, no_assembly: bool):
 
         for video_fmt in fmts:
             job_id = f"day{day:02d}_{video_fmt}_{uuid.uuid4().hex[:6]}"
+            log.info(f"--- Day {day:02d} | format={video_fmt} | job={job_id} ---")
 
             try:
                 # Script
                 script_data = write_script(day_plan, video_fmt)
                 full_script = script_data.get("full_script", "")
+                log.info(f"  Script: {script_data.get('word_count',0)} words, ~{script_data.get('estimated_duration_seconds',0)}s")
 
                 # Metadata
                 metadata = generate_metadata(topic, day, day_plan["title"], video_fmt)
@@ -592,9 +661,12 @@ def run(topic: str, fmt: str, days: int, start_day: int, no_assembly: bool):
                 results.append(record)
 
             except Exception as e:
-                console.print(f"[red]  ❌ Day {day} ({video_fmt}) failed: {e}[/red]")
                 import traceback
-                console.print(f"[dim]{traceback.format_exc()}[/dim]")
+                tb = traceback.format_exc()
+                log.error(f"Day {day} ({video_fmt}) FAILED: {e}\n{tb}")
+                console.print(f"[red]  ❌ Day {day} ({video_fmt}) failed: {e}[/red]")
+                console.print(f"[dim]{tb}[/dim]")
+                console.print(f"[yellow]  → Check log for full details: {LOG_FILE.resolve()}[/yellow]")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     console.print(f"\n[bold cyan]{'='*55}[/bold cyan]")
