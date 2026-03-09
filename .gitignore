@@ -44,3 +44,5 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
+/.vs/youtube-ai-agent.slnx/FileContentIndex
+/.vs/slnx.sqlite
