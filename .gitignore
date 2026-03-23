@@ -46,3 +46,4 @@ logs/
 htmlcov/
 /.vs/youtube-ai-agent.slnx/FileContentIndex
 /.vs/slnx.sqlite
+/.vs
