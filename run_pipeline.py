@@ -57,6 +57,7 @@ import json
 import os
 import re
 import time
+import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -101,6 +102,12 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("pipeline")
+
+# Suppress harmless Windows/moviepy warnings
+import warnings
+warnings.filterwarnings("ignore", message=".*handle is invalid.*")
+warnings.filterwarnings("ignore", message=".*bytes wanted but 0 bytes read.*")
+logging.getLogger("moviepy").setLevel(logging.ERROR)
 
 def log_groq_request(label: str, prompt: str):
     log.debug("=" * 70)
@@ -174,7 +181,7 @@ def parse_json(text: str, expect: str = "dict"):
     """
     Robustly extract JSON from LLM output.
     expect = 'dict' | 'list'
-    Also handles the common case where the LLM wraps a single object in [].
+    Handles markdown fences, list-wrapped dicts, and multi-item lists.
     """
     text = text.strip()
     # Strip markdown fences
@@ -182,14 +189,23 @@ def parse_json(text: str, expect: str = "dict"):
     text = re.sub(r"\s*```\s*$", "", text, flags=re.MULTILINE)
     text = text.strip()
 
+    def unwrap(parsed):
+        """If we want a dict but got a list, unwrap any/all items."""
+        if expect == "dict":
+            if isinstance(parsed, list):
+                # Single item list → unwrap
+                if len(parsed) == 1 and isinstance(parsed[0], dict):
+                    log.debug("parse_json: unwrapped single-item list → dict")
+                    return parsed[0]
+                # Multi-item list where first item is a dict → take first
+                if len(parsed) > 1 and isinstance(parsed[0], dict):
+                    log.debug(f"parse_json: list had {len(parsed)} items, taking first dict")
+                    return parsed[0]
+        return parsed
+
     # Try direct parse first
     try:
-        parsed = json.loads(text)
-        # If we expected a dict but got a 1-item list containing a dict, unwrap it
-        if expect == "dict" and isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
-            log.debug("parse_json: unwrapped single-item list → dict")
-            return parsed[0]
-        return parsed
+        return unwrap(json.loads(text))
     except json.JSONDecodeError:
         pass
 
@@ -200,11 +216,7 @@ def parse_json(text: str, expect: str = "dict"):
         e = text.rfind(end) + 1
         if s >= 0 and e > s:
             try:
-                parsed = json.loads(text[s:e])
-                if expect == "dict" and isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
-                    log.debug("parse_json: unwrapped single-item list → dict (bracket extract)")
-                    return parsed[0]
-                return parsed
+                return unwrap(json.loads(text[s:e]))
             except json.JSONDecodeError:
                 pass
 
@@ -297,7 +309,13 @@ Return ONLY valid JSON:
   "full_script": "...",
   "word_count": 0,
   "estimated_duration_seconds": 0,
-  "scene_breaks": ["0s: ...", "15s: ...", "45s: ..."]
+  "scene_breaks": ["0s: ...", "15s: ...", "45s: ..."],
+  "visual_queries": [
+    "2-4 word Pexels search for hook scene",
+    "2-4 word Pexels search for setup scene",
+    "2-4 word Pexels search for value scene",
+    "2-4 word Pexels search for CTA scene"
+  ]
 }}
 """
     else:
@@ -324,7 +342,14 @@ Return ONLY valid JSON:
   "full_script": "...",
   "word_count": 0,
   "estimated_duration_seconds": 0,
-  "search_queries_for_visuals": ["query1", "query2", "query3", "query4", "query5"]
+  "visual_queries": [
+    "2-4 word Pexels query matching section 1 content",
+    "2-4 word Pexels query matching section 2 content",
+    "2-4 word Pexels query matching section 3 content",
+    "2-4 word Pexels query matching section 4 content",
+    "2-4 word Pexels query matching section 5 content",
+    "2-4 word Pexels query matching section 6 content"
+  ]
 }}
 """
 
@@ -339,12 +364,47 @@ Return ONLY valid JSON:
                   "estimated_duration_seconds": 58 if fmt == "short" else 480,
                   "scene_breaks": [], "search_queries_for_visuals": [title, angle]}
 
+    # If full_script itself contains a nested JSON string, unwrap it
+    result = unwrap_nested_script(result)
+
     # Save script to file
     script_path = OUTPUT_DIR / "scripts" / f"day{day:02d}_{fmt}_script.json"
     script_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     console.print(f"  [green]✅ Script saved: {script_path.name}[/green]")
     return result
 
+def unwrap_nested_script(result: dict) -> dict:
+    """
+    The LLM sometimes puts a full JSON object inside the full_script string.
+    This detects that and extracts the real script text from the inner JSON.
+    Also strips any markdown fences from the script text.
+    """
+    script = result.get("full_script", "")
+
+    # Strip markdown fences
+    script = re.sub(r"^```(?:json)?\s*", "", script.strip(), flags=re.MULTILINE)
+    script = re.sub(r"\s*```\s*$", "", script.strip(), flags=re.MULTILINE)
+    script = script.strip()
+
+    # Check if the script field itself contains a JSON object
+    if script.startswith("{") or script.startswith("["):
+        try:
+            inner = json.loads(script)
+            if isinstance(inner, dict) and "full_script" in inner:
+                log.debug("unwrap_nested_script: extracted inner full_script")
+                # Merge inner keys into result, preferring inner values
+                for k, v in inner.items():
+                    if v:  # don't overwrite with empty values
+                        result[k] = v
+                script = inner["full_script"]
+        except json.JSONDecodeError:
+            pass
+
+    # Final clean — strip any remaining fences from the resolved script
+    script = re.sub(r"^```(?:json)?\s*", "", script.strip(), flags=re.MULTILINE)
+    script = re.sub(r"\s*```\s*$", "", script.strip(), flags=re.MULTILINE)
+    result["full_script"] = script.strip()
+    return result
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PHASE 2B — STOCK FOOTAGE
@@ -452,6 +512,26 @@ def generate_voiceover(job_id: str, script: str, fmt: str) -> str | None:
 # PHASE 2D — VIDEO ASSEMBLY (moviepy)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def fit_clip_to_frame(clip, w: int, h: int):
+    """
+    Scale a clip so it fills (w, h) exactly, cropping the excess.
+    Works correctly with moviepy 1.0.3.
+    """
+    clip_ratio  = clip.w / clip.h
+    frame_ratio = w / h
+
+    if clip_ratio > frame_ratio:
+        # Clip is wider than frame → fit by height, crop sides
+        scaled = clip.resize(height=h)
+        x1 = (scaled.w - w) / 2
+        return scaled.crop(x1=x1, y1=0, x2=x1 + w, y2=h)
+    else:
+        # Clip is taller than frame → fit by width, crop top/bottom
+        scaled = clip.resize(width=w)
+        y1 = (scaled.h - h) / 2
+        return scaled.crop(x1=0, y1=y1, x2=w, y2=y1 + h)
+
+
 def assemble_video(job_id: str, day: int, fmt: str, title: str,
                    clip_paths: list, voiceover_path: str | None) -> str | None:
     out_dir = OUTPUT_DIR / "videos" / job_id
@@ -463,72 +543,111 @@ def assemble_video(job_id: str, day: int, fmt: str, title: str,
         return str(out_path)
 
     console.print(f"  [cyan]Assembling video...[/cyan]")
+    log.info(f"assemble_video: job={job_id} day={day} fmt={fmt} clips={clip_paths} audio={voiceover_path}")
 
     try:
         from moviepy.editor import (
             AudioFileClip, ColorClip, CompositeVideoClip,
             TextClip, VideoFileClip, concatenate_videoclips,
         )
-        from moviepy.video.fx.all import crop, resize
 
         w, h       = (1080, 1920) if fmt == "short" else (1920, 1080)
         target_dur = 58.0        if fmt == "short" else 480.0
 
-        # Load voiceover and set actual duration
+        # ── Load voiceover ────────────────────────────────────────────────────
+        vo = None
+        actual_dur = target_dur
         if voiceover_path and os.path.exists(voiceover_path):
-            vo         = AudioFileClip(voiceover_path)
-            actual_dur = min(vo.duration, target_dur)
+            try:
+                vo = AudioFileClip(voiceover_path)
+                actual_dur = min(vo.duration, target_dur)
+                log.info(f"  voiceover loaded: {vo.duration:.1f}s → using {actual_dur:.1f}s")
+            except Exception as e:
+                log.error(f"  voiceover load failed: {e}")
+                vo = None
         else:
-            vo         = None
-            actual_dur = target_dur
+            log.warning(f"  no voiceover file at {voiceover_path}")
 
-        # Background
-        valid = [p for p in clip_paths if p and os.path.exists(p)]
+        # ── Load and fit video clips ──────────────────────────────────────────
+        valid = [p for p in (clip_paths or []) if p and os.path.exists(p)]
+        log.info(f"  valid clip paths: {valid}")
+
         bg_clips = []
-
         if valid:
-            per = actual_dur / len(valid)
+            per_clip = actual_dur / len(valid)
+            log.info(f"  {len(valid)} clips × {per_clip:.1f}s each")
+
             for cp in valid:
                 try:
-                    c = VideoFileClip(cp).without_audio()
-                    # Fit to target resolution
-                    if c.w / c.h > w / h:
-                        c = c.fx(resize, height=h).fx(crop, width=w, x_center=c.w/2 if hasattr(c,'w') else 0)
-                    else:
-                        c = c.fx(resize, width=w).fx(crop, height=h, y_center=c.h/2 if hasattr(c,'h') else 0)
-                    if c.duration < per:
-                        from moviepy.editor import concatenate_videoclips as cv
-                        loops = int(per / c.duration) + 1
-                        c = cv([c] * loops)
-                    bg_clips.append(c.subclip(0, per))
+                    raw = VideoFileClip(cp).without_audio()
+                    log.info(f"  clip loaded: {Path(cp).name} {raw.w}×{raw.h} {raw.duration:.1f}s")
+
+                    # Fit to frame
+                    fitted = fit_clip_to_frame(raw, w, h)
+
+                    # Loop if shorter than required duration
+                    if fitted.duration < per_clip:
+                        loops = int(per_clip / fitted.duration) + 1
+                        fitted = concatenate_videoclips([fitted] * loops)
+                        log.info(f"    looped ×{loops}")
+
+                    # Trim 0.5s from end to avoid corrupt frames near clip boundary
+                    safe_dur = min(per_clip, fitted.duration - 0.5)
+                    if safe_dur > 0:
+                        fitted = fitted.subclip(0, safe_dur)
+                    bg_clips.append(fitted)
+                    log.info(f"    added to timeline: {per_clip:.1f}s")
+
                 except Exception as e:
-                    console.print(f"  [dim]Skipping clip: {e}[/dim]")
+                    log.error(f"  clip failed ({Path(cp).name}): {e}")
+                    console.print(f"  [yellow]  Skipping clip {Path(cp).name}: {e}[/yellow]")
 
         if not bg_clips:
+            log.warning("  no clips loaded — using colour background")
+            console.print("  [yellow]  No clips loaded — using colour background[/yellow]")
             bg_clips = [ColorClip(size=(w, h), color=(15, 15, 30), duration=actual_dur)]
 
-        background = concatenate_videoclips(bg_clips).subclip(0, actual_dur)
+        # ── Concatenate background ────────────────────────────────────────────
+        background = concatenate_videoclips(bg_clips)
+        # Trim to exact duration in case of rounding
+        if background.duration > actual_dur + 0.1:
+            background = background.subclip(0, actual_dur)
+        log.info(f"  background assembled: {background.w}×{background.h} {background.duration:.1f}s")
 
-        # Day counter
+        # ── Text overlay ──────────────────────────────────────────────────────
         layers = [background]
         try:
-            wm = (TextClip(f"Day {day}/30", fontsize=36, color="white", font="Arial")
-                  .set_position(("right", "top")).set_opacity(0.7).set_duration(actual_dur))
-            layers.append(wm)
-        except Exception:
-            pass
+            txt = (TextClip(f"Day {day} / 30", fontsize=40, color="white",
+                            font="Arial-Bold", stroke_color="black", stroke_width=1)
+                   .set_position(("right", "top"))
+                   .set_opacity(0.8)
+                   .set_duration(actual_dur))
+            layers.append(txt)
+        except Exception as e:
+            log.warning(f"  TextClip failed (non-fatal): {e}")
 
-        final = CompositeVideoClip(layers, size=(w, h)).subclip(0, actual_dur)
+        # ── Compose and attach audio ──────────────────────────────────────────
+        final = CompositeVideoClip(layers, size=(w, h))
         if vo:
-            final = final.set_audio(vo)
+            final = final.set_audio(vo.subclip(0, min(vo.duration, actual_dur)))
 
-        console.print(f"  [cyan]Rendering → {out_path.name} (this takes a minute)...[/cyan]")
+        # ── Render ────────────────────────────────────────────────────────────
+        console.print(f"  [cyan]Rendering {out_path.name} ({w}×{h}, {actual_dur:.0f}s)...[/cyan]")
+        log.info(f"  rendering → {out_path}")
+
         final.write_videofile(
-            str(out_path), fps=30, codec="libx264", audio_codec="aac",
-            temp_audiofile=str(out_dir / "tmp_audio.m4a"), remove_temp=True,
-            preset="fast", ffmpeg_params=["-crf", "23"], logger=None,
+            str(out_path),
+            fps=24,
+            codec="libx264",
+            audio_codec="aac",
+            temp_audiofile=str(out_dir / "tmp_audio.m4a"),
+            remove_temp=True,
+            preset="fast",
+            ffmpeg_params=["-crf", "23"],
+            logger=None,
         )
 
+        # ── Cleanup ───────────────────────────────────────────────────────────
         for c in bg_clips:
             try: c.close()
             except: pass
@@ -538,15 +657,20 @@ def assemble_video(job_id: str, day: int, fmt: str, title: str,
             try: vo.close()
             except: pass
 
-        console.print(f"  [green]✅ Video rendered: {out_path.name}[/green]")
+        size_mb = round(out_path.stat().st_size / 1024 / 1024, 1)
+        console.print(f"  [green]✅ Video rendered: {out_path.name} ({size_mb} MB)[/green]")
+        log.info(f"  render complete: {out_path.name} {size_mb} MB")
         return str(out_path)
 
     except ImportError:
         console.print("  [yellow]moviepy not installed — skipping assembly[/yellow]")
-        console.print("  [dim]Run: pip install moviepy==1.0.3[/dim]")
+        console.print("  [dim]pip install moviepy==1.0.3[/dim]")
         return None
     except Exception as e:
+        tb = traceback.format_exc()
+        log.error(f"assemble_video failed: {e}\n{tb}")
         console.print(f"  [red]  Assembly failed: {e}[/red]")
+        console.print(f"  [dim]{tb}[/dim]")
         return None
 
 
@@ -630,8 +754,9 @@ def run(topic: str, fmt: str, days: int, start_day: int, no_assembly: bool):
                 video_path = None
                 if not no_assembly:
                     # Footage
-                    queries = (script_data.get("search_queries_for_visuals")
-                               or day_plan.get("keywords", [day_plan["title"]])[:4])
+                    queries = (script_data.get("visual_queries")
+                                or script_data.get("search_queries_for_visuals")
+                                or day_plan.get("keywords", [day_plan["title"]])[:4])
                     clips = download_clips(job_id, queries, video_fmt)
 
                     # Voiceover

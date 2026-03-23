@@ -288,7 +288,7 @@ def api_retry_step():
                 queries = day_plan.get("keywords", [day_plan["title"]])[:4]
                 if script_path.exists():
                     sd = json.loads(script_path.read_text())
-                    queries = sd.get("search_queries_for_visuals") or queries
+                    queries = sd.get("visual_queries") or sd.get("search_queries_for_visuals") or queries
                 clips = download_clips(job_id, queries, fmt)
                 push_step(day_num, fmt, "footage", "done", f"{len(clips)} clips")
                 push_log("info", f"Retry footage day {day_num}: {len(clips)} clips")
